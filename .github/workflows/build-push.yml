@@ -1,15 +1,15 @@
-# .github/workflows/build-push.yml
-name: Build & Push LoRA Inference
+name: Build & Push Inference Image
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
-  IMAGE: diegocorraliza/lora-inferenceDC
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/lora-inference
 
 jobs:
-  build:
+  build-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +26,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:v4-${{ github.run_number }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:v1-${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
