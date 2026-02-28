@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
 
+env:
+  IMAGE_NAME: ghcr.io/diegocorraliza1-svg/lora-inferencedc
+
+
 jobs:
   build:
     runs-on: ubuntu-latest
