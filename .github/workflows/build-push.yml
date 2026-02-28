@@ -1,16 +1,19 @@
-name: Build & Push Inference Worker
+name: Build & Push Inference Image
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/diegocorraliza1-svg/lora-inferencedc
 
-
 jobs:
-  build:
+  build-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +30,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:v1-${{ github.run_number }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:v1-${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
