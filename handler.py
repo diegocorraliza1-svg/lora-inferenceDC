@@ -1,5 +1,6 @@
 """
 RunPod Serverless handler for SDXL inference with dual LoRA support.
+
 Supports txt2img and img2img modes.
 Images uploaded to Supabase Storage (not returned as base64).
 
@@ -24,6 +25,7 @@ from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLImg2ImgPipeline,
     AutoencoderKL,
+    DPMSolverMultistepScheduler,
 )
 
 # ── Config (global, loaded once) ────────────────────────────────────────────
@@ -52,6 +54,14 @@ txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
     variant="fp16" if DTYPE == torch.float16 else None,
 )
 txt2img_pipe.to(DEVICE)
+
+# ── Scheduler: DPM++ 2M Karras (sharper, more detailed results) ────────────
+txt2img_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+    txt2img_pipe.scheduler.config,
+    use_karras_sigmas=True,
+    algorithm_type="dpmsolver++",
+)
+print("[init] Scheduler: DPM++ 2M Karras")
 
 try:
     txt2img_pipe.enable_xformers_memory_efficient_attention()
@@ -92,7 +102,6 @@ def download_lora(storage_path: str) -> str:
     local_path = os.path.join(LORA_CACHE_DIR, storage_path.replace("/", "_"))
     with open(local_path, "wb") as f:
         f.write(r.content)
-
     _lora_cache[storage_path] = local_path
     size_mb = len(r.content) / 1024 / 1024
     print(f"[lora] Saved {local_path} ({size_mb:.1f} MB)")
@@ -114,7 +123,6 @@ def upload_to_supabase(
         "Content-Type": content_type,
         "x-upsert": "true",
     }
-
     print(f"[upload] File size: {len(data) / 1024 / 1024:.1f} MB")
 
     for attempt in range(1, max_retries + 1):
@@ -126,16 +134,15 @@ def upload_to_supabase(
             print(f"[upload] Attempt {attempt}/{max_retries} failed {r.status_code}: {r.text}")
         except requests.exceptions.RequestException as e:
             print(f"[upload] Attempt {attempt}/{max_retries} network error: {e}")
-
         if attempt < max_retries:
             wait = 2 ** attempt
             print(f"[upload] Retrying in {wait}s...")
             time.sleep(wait)
-
     raise RuntimeError(f"Failed to upload {storage_path} after {max_retries} attempts")
 
 
 # ── LoRA management ─────────────────────────────────────────────────────────
+
 def apply_loras(pipe, lora_configs: list[dict]):
     """Load and set multiple LoRAs into the pipeline."""
     try:
@@ -161,6 +168,7 @@ def apply_loras(pipe, lora_configs: list[dict]):
 
 
 # ── Handler ─────────────────────────────────────────────────────────────────
+
 def handler(job):
     inp = job["input"]
 
@@ -168,7 +176,7 @@ def handler(job):
     negative_prompt = inp.get("negative_prompt", "blurry, low quality, deformed")
     width = inp.get("width", 1024)
     height = inp.get("height", 1024)
-    steps = inp.get("steps", 28)
+    steps = inp.get("steps", 32)
     cfg = inp.get("cfg", 7.0)
     seed = inp.get("seed", -1)
     num_images = inp.get("num_images", 1)
