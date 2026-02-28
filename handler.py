@@ -1,7 +1,15 @@
 """
 RunPod Serverless handler for SDXL inference with dual LoRA support.
 Supports txt2img and img2img modes.
-Images are uploaded to Supabase Storage instead of returned as base64.
+Images uploaded to Supabase Storage (not returned as base64).
+
+Patterns aligned with trainer handler:
+- requests + REST API (no supabase-py)
+- Upload with retry + exponential backoff
+- python -u in CMD for real-time logs
+- xformers in try/except
+- os.getenv() for global env vars
+- Upload BEFORE returning (no race condition)
 """
 
 import os
@@ -10,15 +18,15 @@ import base64
 import time
 import torch
 import runpod
+import requests
 from PIL import Image
 from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLImg2ImgPipeline,
     AutoencoderKL,
 )
-import requests
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config (global, loaded once) ────────────────────────────────────────────
 MODEL_ID = os.getenv("BASE_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 VAE_ID = os.getenv("VAE_ID", "madebyollin/sdxl-vae-fp16-fix")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,6 +39,7 @@ LORA_CACHE_DIR = "/tmp/loras"
 os.makedirs(LORA_CACHE_DIR, exist_ok=True)
 
 # ── Global pipeline (loaded once at cold start) ────────────────────────────
+print(f"[init] device={DEVICE} dtype={DTYPE}")
 print(f"[init] Loading VAE from {VAE_ID}...")
 vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
 
@@ -44,7 +53,6 @@ txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
 )
 txt2img_pipe.to(DEVICE)
 
-# SDPA is default in diffusers 0.27+; xformers is optional
 try:
     txt2img_pipe.enable_xformers_memory_efficient_attention()
     print("[init] xformers enabled")
@@ -64,26 +72,18 @@ img2img_pipe.to(DEVICE)
 print("[init] Pipelines ready.")
 
 
-# ── Supabase helpers ────────────────────────────────────────────────────────
+# ── Supabase Storage helpers ────────────────────────────────────────────────
 _lora_cache: dict[str, str] = {}
 
 
-def _supabase_headers() -> dict:
-    return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    }
-
-
 def download_lora(storage_path: str) -> str:
-    """Download a LoRA .safetensors from Supabase public bucket, with local cache."""
+    """Download LoRA from public bucket 'loras'. Cached in /tmp."""
     if storage_path in _lora_cache:
         local = _lora_cache[storage_path]
         if os.path.exists(local):
             print(f"[lora] Cache hit: {storage_path}")
             return local
 
-    # Public bucket → no auth needed
     url = f"{SUPABASE_URL}/storage/v1/object/public/loras/{storage_path}"
     print(f"[lora] Downloading {url}...")
     r = requests.get(url, timeout=300)
@@ -94,7 +94,8 @@ def download_lora(storage_path: str) -> str:
         f.write(r.content)
 
     _lora_cache[storage_path] = local_path
-    print(f"[lora] Saved {local_path} ({len(r.content) / 1024 / 1024:.1f} MB)")
+    size_mb = len(r.content) / 1024 / 1024
+    print(f"[lora] Saved {local_path} ({size_mb:.1f} MB)")
     return local_path
 
 
@@ -104,14 +105,17 @@ def upload_to_supabase(
     bucket: str = "generations",
     content_type: str = "image/png",
     max_retries: int = 3,
-) -> str:
-    """Upload bytes to Supabase Storage with retry + upsert."""
+):
+    """Upload bytes to Supabase Storage with retry + exponential backoff."""
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{storage_path}"
     headers = {
-        **_supabase_headers(),
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": content_type,
         "x-upsert": "true",
     }
+
+    print(f"[upload] File size: {len(data) / 1024 / 1024:.1f} MB")
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -119,13 +123,14 @@ def upload_to_supabase(
             if r.ok:
                 print(f"[upload] OK → {bucket}/{storage_path}")
                 return storage_path
-            print(f"[upload] Attempt {attempt} failed {r.status_code}: {r.text}")
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
+            print(f"[upload] Attempt {attempt}/{max_retries} failed {r.status_code}: {r.text}")
         except requests.exceptions.RequestException as e:
-            print(f"[upload] Attempt {attempt} error: {e}")
-            if attempt < max_retries:
-                time.sleep(2 ** attempt)
+            print(f"[upload] Attempt {attempt}/{max_retries} network error: {e}")
+
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"[upload] Retrying in {wait}s...")
+            time.sleep(wait)
 
     raise RuntimeError(f"Failed to upload {storage_path} after {max_retries} attempts")
 
@@ -185,6 +190,8 @@ def handler(job):
     user_id = inp.get("user_id", "unknown")
     job_id = job.get("id", f"job_{int(time.time())}")
 
+    print(f"[infer] mode={mode} prompt='{prompt[:60]}...' {width}x{height} steps={steps}")
+
     # Inject trigger word
     if trigger_word and trigger_word not in prompt:
         prompt = f"{trigger_word}, {prompt}"
@@ -193,6 +200,7 @@ def handler(job):
     if seed < 0:
         seed = torch.randint(0, 2**32, (1,)).item()
     generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    print(f"[infer] seed={seed}")
 
     # Build LoRA list
     lora_configs = []
@@ -222,7 +230,7 @@ def handler(job):
         apply_loras(pipe, lora_configs)
         result = pipe(width=width, height=height, **common_args)
 
-    # Upload to Storage instead of returning base64
+    # Upload each image to Storage BEFORE returning (no race condition)
     output_paths = []
     for i, img in enumerate(result.images):
         buf = io.BytesIO()
@@ -230,8 +238,9 @@ def handler(job):
         storage_path = f"{user_id}/{project_id}/{job_id}_{i}.png"
         upload_to_supabase(buf.getvalue(), storage_path)
         output_paths.append(storage_path)
+        print(f"[infer] Uploaded image {i+1}/{len(result.images)}")
 
-    # Clean up LoRAs from VRAM
+    # Free VRAM
     try:
         pipe.unload_lora_weights()
     except Exception:
@@ -249,6 +258,7 @@ def handler(job):
             "mode": mode,
             "width": width,
             "height": height,
+            "num_images": num_images,
             "lora_weight": lora_weight if lora_url else 0,
             "style_lora_weight": style_lora_weight if style_lora_url else 0,
             "strength": strength if mode == "img2img" else None,
