@@ -1,299 +1,32 @@
-"""
-RunPod Serverless handler for SDXL inference with dual LoRA support + Face Restore.
-Supports txt2img and img2img modes.
-Images uploaded to Supabase Storage (not returned as base64).
-"""
+name: Build & Push Inference Image
 
-import os
-import io
-import base64
-import time
-import torch
-import runpod
-import requests
-import numpy as np
-from PIL import Image
-from diffusers import (
-    StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,
-    AutoencoderKL,
-    DPMSolverMultistepScheduler,
-)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
-# ── Config (global, loaded once) ────────────────────────────────────────────
-MODEL_ID = os.getenv("BASE_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
-VAE_ID = os.getenv("VAE_ID", "madebyollin/sdxl-vae-fp16-fix")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-LORA_CACHE_DIR = "/tmp/loras"
-os.makedirs(LORA_CACHE_DIR, exist_ok=True)
+env:
+  IMAGE_NAME: diegocorraliza/lora-inferencedc
 
-# ── Global pipeline (loaded once at cold start) ────────────────────────────
-print(f"[init] device={DEVICE} dtype={DTYPE}")
-print(f"[init] Loading VAE from {VAE_ID}...")
-vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-print(f"[init] Loading SDXL pipeline from {MODEL_ID}...")
-txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-    MODEL_ID,
-    vae=vae,
-    torch_dtype=DTYPE,
-    use_safetensors=True,
-    variant="fp16" if DTYPE == torch.float16 else None,
-)
-txt2img_pipe.to(DEVICE)
+      - uses: docker/setup-buildx-action@v3
 
-txt2img_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-    txt2img_pipe.scheduler.config,
-    use_karras_sigmas=True,
-    algorithm_type="dpmsolver++",
-)
-print("[init] Scheduler: DPM++ 2M Karras")
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-try:
-    txt2img_pipe.enable_xformers_memory_efficient_attention()
-    print("[init] xformers enabled")
-except Exception:
-    print("[init] xformers not available, using SDPA (default)")
-
-img2img_pipe = StableDiffusionXLImg2ImgPipeline(
-    vae=txt2img_pipe.vae,
-    text_encoder=txt2img_pipe.text_encoder,
-    text_encoder_2=txt2img_pipe.text_encoder_2,
-    tokenizer=txt2img_pipe.tokenizer,
-    tokenizer_2=txt2img_pipe.tokenizer_2,
-    unet=txt2img_pipe.unet,
-    scheduler=txt2img_pipe.scheduler,
-)
-img2img_pipe.to(DEVICE)
-print("[init] Pipelines ready.")
-
-# ── GFPGAN Face Restore (loaded once) ──────────────────────────────────────
-FACE_RESTORER = None
-try:
-    from gfpgan import GFPGANer
-    FACE_RESTORER = GFPGANer(
-        model_path="/app/weights/GFPGANv1.4.pth",
-        upscale=1,
-        arch="clean",
-        channel_multiplier=2,
-        bg_upsampler=None,
-    )
-    print("[init] GFPGAN face restorer loaded")
-except Exception as e:
-    print(f"[init] GFPGAN not available: {e}")
-
-
-def restore_faces(pil_image: Image.Image, strength: float = 0.7) -> Image.Image:
-    """Apply GFPGAN face restoration to a PIL image."""
-    if FACE_RESTORER is None:
-        print("[face_restore] GFPGAN not loaded, skipping")
-        return pil_image
-
-    img_np = np.array(pil_image)[:, :, ::-1]  # RGB -> BGR for OpenCV
-    _, _, restored = FACE_RESTORER.enhance(
-        img_np,
-        has_aligned=False,
-        only_center_face=False,
-        paste_back=True,
-        weight=strength,
-    )
-    if restored is not None:
-        restored_rgb = restored[:, :, ::-1]  # BGR -> RGB
-        return Image.fromarray(restored_rgb)
-    print("[face_restore] No faces detected, returning original")
-    return pil_image
-
-
-# ── Supabase Storage helpers ────────────────────────────────────────────────
-_lora_cache: dict[str, str] = {}
-
-def download_lora(storage_path: str) -> str:
-    if storage_path in _lora_cache:
-        local = _lora_cache[storage_path]
-        if os.path.exists(local):
-            print(f"[lora] Cache hit: {storage_path}")
-            return local
-    url = f"{SUPABASE_URL}/storage/v1/object/public/loras/{storage_path}"
-    print(f"[lora] Downloading {url}...")
-    r = requests.get(url, timeout=300)
-    r.raise_for_status()
-    local_path = os.path.join(LORA_CACHE_DIR, storage_path.replace("/", "_"))
-    with open(local_path, "wb") as f:
-        f.write(r.content)
-    _lora_cache[storage_path] = local_path
-    size_mb = len(r.content) / 1024 / 1024
-    print(f"[lora] Saved {local_path} ({size_mb:.1f} MB)")
-    return local_path
-
-def upload_to_supabase(
-    data: bytes,
-    storage_path: str,
-    bucket: str = "generations",
-    content_type: str = "image/png",
-    max_retries: int = 3,
-):
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{storage_path}"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": content_type,
-        "x-upsert": "true",
-    }
-    print(f"[upload] File size: {len(data) / 1024 / 1024:.1f} MB")
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = requests.post(url, headers=headers, data=data, timeout=120)
-            if r.ok:
-                print(f"[upload] OK → {bucket}/{storage_path}")
-                return storage_path
-            print(f"[upload] Attempt {attempt}/{max_retries} failed {r.status_code}: {r.text}")
-        except requests.exceptions.RequestException as e:
-            print(f"[upload] Attempt {attempt}/{max_retries} network error: {e}")
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            print(f"[upload] Retrying in {wait}s...")
-            time.sleep(wait)
-    raise RuntimeError(f"Failed to upload {storage_path} after {max_retries} attempts")
-
-# ── LoRA management ─────────────────────────────────────────────────────────
-def apply_loras(pipe, lora_configs: list[dict]):
-    try:
-        pipe.unload_lora_weights()
-    except Exception:
-        pass
-    if not lora_configs:
-        return
-    adapter_names = []
-    adapter_weights = []
-    for cfg in lora_configs:
-        local_path = download_lora(cfg["path"])
-        adapter_name = cfg["adapter_name"]
-        pipe.load_lora_weights(local_path, adapter_name=adapter_name)
-        adapter_names.append(adapter_name)
-        adapter_weights.append(cfg["weight"])
-        print(f"[lora] Loaded '{adapter_name}' weight={cfg['weight']}")
-    pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
-
-# ── Handler ─────────────────────────────────────────────────────────────────
-def handler(job):
-    inp = job["input"]
-    prompt = inp.get("prompt", "")
-    negative_prompt = inp.get("negative_prompt", "blurry, low quality, deformed")
-    width = inp.get("width", 1024)
-    height = inp.get("height", 1024)
-    steps = inp.get("steps", 32)
-    cfg = inp.get("cfg", 7.0)
-    seed = inp.get("seed", -1)
-    num_images = inp.get("num_images", 1)
-    mode = inp.get("mode", "txt2img")
-
-    # Face restore params
-    face_restore = inp.get("face_restore", False)
-    face_restore_strength = inp.get("face_restore_strength", 0.7)
-
-    # LoRA config
-    lora_url = inp.get("lora_url")
-    lora_weight = inp.get("lora_weight", 0.75)
-    trigger_word = inp.get("trigger_word", "")
-    style_lora_url = inp.get("style_lora_url")
-    style_lora_weight = inp.get("style_lora_weight", 0.5)
-
-    # img2img
-    init_image_base64 = inp.get("init_image_base64")
-    strength = inp.get("strength", 0.65)
-
-    # Context for upload paths
-    project_id = inp.get("project_id", "unknown")
-    user_id = inp.get("user_id", "unknown")
-    job_id = job.get("id", f"job_{int(time.time())}")
-
-    print(f"[infer] mode={mode} prompt='{prompt[:60]}...' {width}x{height} steps={steps} face_restore={face_restore}")
-
-    # Inject trigger word
-    if trigger_word and trigger_word not in prompt:
-        prompt = f"{trigger_word}, {prompt}"
-
-    # Seed
-    if seed < 0:
-        seed = torch.randint(0, 2**32, (1,)).item()
-    generator = torch.Generator(device=DEVICE).manual_seed(seed)
-    print(f"[infer] seed={seed}")
-
-    # Build LoRA list
-    lora_configs = []
-    if lora_url:
-        lora_configs.append({"path": lora_url, "weight": lora_weight, "adapter_name": "subject"})
-    if style_lora_url:
-        lora_configs.append({"path": style_lora_url, "weight": style_lora_weight, "adapter_name": "style"})
-
-    # Generate
-    common_args = dict(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        num_inference_steps=steps,
-        guidance_scale=cfg,
-        generator=generator,
-        num_images_per_prompt=num_images,
-    )
-
-    if mode == "img2img" and init_image_base64:
-        pipe = img2img_pipe
-        apply_loras(pipe, lora_configs)
-        init_bytes = base64.b64decode(init_image_base64)
-        init_image = Image.open(io.BytesIO(init_bytes)).convert("RGB").resize((width, height))
-        result = pipe(image=init_image, strength=strength, **common_args)
-    else:
-        pipe = txt2img_pipe
-        apply_loras(pipe, lora_configs)
-        result = pipe(width=width, height=height, **common_args)
-
-    # Face restore post-processing
-    if face_restore:
-        print(f"[face_restore] Applying GFPGAN (strength={face_restore_strength})...")
-        restored_images = []
-        for img in result.images:
-            restored_images.append(restore_faces(img, strength=face_restore_strength))
-        result.images = restored_images
-        print("[face_restore] Done")
-
-    # Upload each image to Storage BEFORE returning
-    output_paths = []
-    for i, img in enumerate(result.images):
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        storage_path = f"{user_id}/{project_id}/{job_id}_{i}.png"
-        upload_to_supabase(buf.getvalue(), storage_path)
-        output_paths.append(storage_path)
-        print(f"[infer] Uploaded image {i+1}/{len(result.images)}")
-
-    # Free VRAM
-    try:
-        pipe.unload_lora_weights()
-    except Exception:
-        pass
-
-    return {
-        "status": "completed",
-        "images": output_paths,
-        "seed": seed,
-        "metadata": {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "steps": steps,
-            "cfg": cfg,
-            "mode": mode,
-            "width": width,
-            "height": height,
-            "num_images": num_images,
-            "lora_weight": lora_weight if lora_url else 0,
-            "style_lora_weight": style_lora_weight if style_lora_url else 0,
-            "strength": strength if mode == "img2img" else None,
-            "face_restore": face_restore,
-            "face_restore_strength": face_restore_strength if face_restore else None,
-        },
-    }
-
-runpod.serverless.start({"handler": handler})
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:v1-${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
