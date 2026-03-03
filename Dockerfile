@@ -1,5 +1,4 @@
-# ── SDXL Inference Worker with Diffusers + Dual LoRA + Face Restore ─────────
-
+# ── SDXL Inference Worker with Diffusers + Dual LoRA ────────────────────────
 FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -7,23 +6,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/root/.cache/huggingface \
     TRANSFORMERS_CACHE=/root/.cache/huggingface
 
-# System deps
+# System deps (aligned with trainer)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3-pip python3-dev git wget libgl1-mesa-glx libglib2.0-0 \
+    python3.10 python3-pip python3-dev git wget \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.10 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# Numpy first
+# Numpy first (trainer lesson)
 RUN pip install --no-cache-dir "numpy==1.26.4"
 
-# PyTorch
+# PyTorch — same as trainer
 RUN pip install --no-cache-dir \
     torch==2.1.2+cu121 torchvision==0.16.2+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Python deps
+# Python deps — versions aligned with trainer where possible
 RUN pip install --no-cache-dir \
     "diffusers[torch]==0.25.0" \
     "transformers==4.36.2" \
@@ -35,10 +34,7 @@ RUN pip install --no-cache-dir \
     requests \
     runpod
 
-# GFPGAN for face restore
-RUN pip install --no-cache-dir gfpgan basicsr facexlib
-
-# Pre-download SDXL base + VAE
+# Pre-download SDXL base + VAE at build time (fast cold start)
 RUN python -c "\
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL; \
 import torch; \
@@ -53,27 +49,17 @@ pipe = StableDiffusionXLPipeline.from_pretrained( \
 print('SDXL + VAE downloaded successfully') \
 "
 
-# Pre-download GFPGAN weights (v1.4)
-RUN python -c "\
-import os, requests; \
-os.makedirs('/app/weights', exist_ok=True); \
-url = 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'; \
-r = requests.get(url, allow_redirects=True); \
-open('/app/weights/GFPGANv1.4.pth', 'wb').write(r.content); \
-print(f'GFPGAN weights downloaded: {len(r.content)} bytes') \
-"
-
-# Verify imports
+# Verify imports (trainer lesson)
 RUN python -c "\
 import numpy; print(f'numpy {numpy.__version__}'); \
 import torch; print(f'torch {torch.__version__}'); \
 import diffusers; print(f'diffusers {diffusers.__version__}'); \
 import peft; print(f'peft {peft.__version__}'); \
-import gfpgan; print(f'gfpgan OK'); \
 import runpod; print(f'runpod {runpod.__version__}'); \
 print('ALL IMPORTS OK')"
 
 WORKDIR /app
 COPY handler.py .
 
+# python -u = unbuffered output for real-time logs
 CMD ["python", "-u", "handler.py"]
